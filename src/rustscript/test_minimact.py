@@ -234,6 +234,18 @@ def main():
         "types": [
             "tests/minimact/types/test_type_conversion_integration.rsc",
         ],
+        "analyzers": [
+            "tests/minimact/analyzers/test_classification.rsc",
+            "tests/minimact/analyzers/test_detection.rsc",
+            "tests/minimact/analyzers/test_hook_detector.rsc",
+        ],
+        "extractors": [
+            "tests/minimact/extractors/test_is_simple_expression.rsc",
+            "tests/minimact/extractors/test_build_member_path.rsc",
+        ],
+        "generators": [
+            "tests/minimact/generators/test_string_methods.rsc",
+        ],
     }
 
     total_passed = 0
