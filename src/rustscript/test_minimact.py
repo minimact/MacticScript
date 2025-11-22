@@ -246,6 +246,9 @@ def main():
         "generators": [
             "tests/minimact/generators/test_string_methods.rsc",
         ],
+        "integration": [
+            "tests/minimact/integration/test_minimact_full.rsc",
+        ],
     }
 
     total_passed = 0
