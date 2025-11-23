@@ -552,9 +552,21 @@ impl Parser {
         } else if self.check(TokenKind::Const) {
             self.parse_const_stmt()
         } else if self.check(TokenKind::If) {
-            self.parse_if_stmt()
+            // Check if this if is followed by a postfix operator (., ?, etc.)
+            // If so, parse as expression to allow chaining
+            // Otherwise, parse as statement
+            if self.peek_if_continues_expr() {
+                self.parse_expr_stmt()  // if ... .method() is an expression
+            } else {
+                self.parse_if_stmt()    // regular if statement
+            }
         } else if self.check(TokenKind::Match) {
-            self.parse_match_stmt()
+            // Check if match is followed by a postfix operator
+            if self.peek_if_continues_expr() {
+                self.parse_expr_stmt()
+            } else {
+                self.parse_match_stmt()
+            }
         } else if self.check(TokenKind::For) {
             self.parse_for_stmt()
         } else if self.check(TokenKind::While) {
@@ -647,12 +659,17 @@ impl Parser {
         let mut else_if_branches = Vec::new();
         let mut else_branch = None;
 
+        self.skip_newlines();
         while self.match_token(TokenKind::Else) {
-            if self.match_token(TokenKind::If) {
-                // Note: else-if with let not supported yet, just regular condition
-                let cond = self.parse_expr_no_struct()?;
-                let block = self.parse_block()?;
-                else_if_branches.push((cond, block));
+            if self.check(TokenKind::If) {
+                // else if - parse recursively as a nested if statement
+                let nested_if = self.parse_if_stmt()?;
+                // Wrap in a block
+                else_branch = Some(Block {
+                    stmts: vec![nested_if],
+                    span: start_span,
+                });
+                break;
             } else {
                 else_branch = Some(self.parse_block()?);
                 break;
@@ -725,6 +742,22 @@ impl Parser {
     /// Parse pattern
     fn parse_pattern(&mut self) -> ParseResult<Pattern> {
 
+        // Check for ref pattern: ref x or ref mut x
+        if self.check_ident("ref") {
+            self.advance();
+            let is_mut = if self.check(TokenKind::Mut) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let inner = self.parse_pattern()?;
+            return Ok(Pattern::Ref {
+                is_mut,
+                pattern: Box::new(inner),
+            });
+        }
+
         // Check for wildcard
         if self.check_ident("_") {
             self.advance();
@@ -770,10 +803,40 @@ impl Parser {
         }
 
         // Identifier, struct pattern, or variant pattern
-        let name = self.expect_ident()?;
+        // Try AST types first (e.g., Literal, Expression), then regular identifiers
+        let name = if let Some(ast_type) = self.try_expect_ast_type() {
+            ast_type
+        } else {
+            self.expect_ident()?
+        };
 
+        // Check for path-qualified pattern: Type::Variant
+        if self.check(TokenKind::ColonColon) {
+            self.advance(); // consume ::
 
-        if self.check(TokenKind::LBrace) {
+            // Try to parse as AST type first, then fall back to regular identifier
+            let variant_name = if let Some(ast_type) = self.try_expect_ast_type() {
+                ast_type
+            } else {
+                self.expect_ident()?
+            };
+
+            // Path-qualified patterns are always variant patterns
+            if self.check(TokenKind::LParen) {
+                // Path::Variant(inner)
+                self.advance();
+                let inner = if self.check(TokenKind::RParen) {
+                    None
+                } else {
+                    Some(Box::new(self.parse_pattern()?))
+                };
+                self.expect(TokenKind::RParen)?;
+                Ok(Pattern::Variant { name: variant_name, inner })
+            } else {
+                // Path::Variant (unit variant)
+                Ok(Pattern::Variant { name: variant_name, inner: None })
+            }
+        } else if self.check(TokenKind::LBrace) {
             // Struct pattern: Name { field: pattern, ... }
             self.advance();
             let mut fields = Vec::new();
@@ -1675,13 +1738,23 @@ impl Parser {
     fn parse_primary(&mut self) -> ParseResult<Expr> {
         let span = self.current_span();
 
+        // If expression (can be used as a value)
+        if self.check(TokenKind::If) {
+            return self.parse_if_expr();
+        }
+
+        // Match expression
+        if self.check(TokenKind::Match) {
+            return self.parse_match_expr();
+        }
+
         // Block expression
         if self.check(TokenKind::LBrace) {
             let block = self.parse_block()?;
             return Ok(Expr::Block(block));
         }
 
-        // Parenthesized expression or unit literal ()
+        // Parenthesized expression, tuple, or unit literal ()
         if self.match_token(TokenKind::LParen) {
             // Check for unit literal ()
             if self.check(TokenKind::RParen) {
@@ -1692,9 +1765,30 @@ impl Parser {
             if self.check(TokenKind::Pipe) {
                 return self.parse_closure(span);
             }
-            let expr = self.parse_expr()?;
-            self.expect(TokenKind::RParen)?;
-            return Ok(Expr::Paren(Box::new(expr)));
+
+            // Parse first expression
+            let first_expr = self.parse_expr()?;
+
+            // Check if this is a tuple (has comma) or just parenthesized expression
+            if self.check(TokenKind::Comma) {
+                // It's a tuple!
+                let mut elements = vec![first_expr];
+
+                while self.match_token(TokenKind::Comma) {
+                    // Allow trailing comma
+                    if self.check(TokenKind::RParen) {
+                        break;
+                    }
+                    elements.push(self.parse_expr()?);
+                }
+
+                self.expect(TokenKind::RParen)?;
+                return Ok(Expr::Tuple(elements));
+            } else {
+                // Just a parenthesized expression
+                self.expect(TokenKind::RParen)?;
+                return Ok(Expr::Paren(Box::new(first_expr)));
+            }
         }
 
         // Closure
@@ -1934,6 +2028,82 @@ impl Parser {
         }))
     }
 
+    /// Parse if expression (can be used as value)
+    fn parse_if_expr(&mut self) -> ParseResult<Expr> {
+        let start_span = self.current_span();
+        self.expect(TokenKind::If)?;
+
+        // Check for if-let pattern: `if let Pattern = expr`
+        let (pattern, condition) = if self.match_token(TokenKind::Let) {
+            let pat = self.parse_pattern()?;
+            self.expect(TokenKind::Eq)?;
+            let expr = self.parse_expr_no_struct()?;
+            (Some(pat), expr)
+        } else {
+            // Use parse_expr_no_struct to avoid ambiguity with block
+            (None, self.parse_expr_no_struct()?)
+        };
+
+        let then_branch = self.parse_block()?;
+
+        // Parse else or else-if branches
+        let else_branch = if self.match_token(TokenKind::Else) {
+            if self.check(TokenKind::If) {
+                // else if - parse as nested if expression inside a block
+                let else_if_expr = self.parse_if_expr()?;
+                Some(Block {
+                    stmts: vec![Stmt::Expr(ExprStmt {
+                        expr: else_if_expr,
+                        span: start_span,
+                    })],
+                    span: start_span,
+                })
+            } else {
+                // else block
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+
+        Ok(Expr::If(Box::new(IfExpr {
+            condition,
+            pattern,
+            then_branch,
+            else_branch,
+            span: start_span,
+        })))
+    }
+
+    /// Parse match expression (can be used as value)
+    fn parse_match_expr(&mut self) -> ParseResult<Expr> {
+        let start_span = self.current_span();
+        self.expect(TokenKind::Match)?;
+
+        // Parse scrutinee - must not consume the { that starts match arms
+        let scrutinee = self.parse_match_scrutinee()?;
+
+        self.expect(TokenKind::LBrace)?;
+
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.check(TokenKind::RBrace) {
+                break;
+            }
+            arms.push(self.parse_match_arm()?);
+            self.skip_newlines();
+        }
+
+        self.expect(TokenKind::RBrace)?;
+
+        Ok(Expr::Match(Box::new(MatchExpr {
+            scrutinee,
+            arms,
+            span: start_span,
+        })))
+    }
+
     /// Parse struct initialization
     fn parse_struct_init(&mut self, name: String, span: Span) -> ParseResult<Expr> {
         self.expect(TokenKind::LBrace)?;
@@ -1995,6 +2165,83 @@ impl Parser {
     }
 
     // === Helper methods ===
+
+    /// Peek ahead to check if an if/match continues as an expression (e.g., followed by . or ?)
+    /// This helps determine if it should be parsed as expression or statement
+    fn peek_if_continues_expr(&self) -> bool {
+        let mut pos = self.pos + 1; // skip 'if' or 'match'
+        let mut brace_depth = 0;
+        let mut seen_first_brace = false;
+        let max_lookahead = 1000; // Safety limit
+        let start_pos = pos;
+
+        // Skip to the end of the if/match construct
+        // We need to track braces carefully - the first { we see is the then-block,
+        // and we need to find its matching }
+        while pos < self.tokens.len() && (pos - start_pos) < max_lookahead {
+            match &self.tokens[pos].kind {
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                    seen_first_brace = true;
+                },
+                TokenKind::RBrace => {
+                    brace_depth -= 1;
+                    // Only stop when we've closed all the braces we opened
+                    if seen_first_brace && brace_depth == 0 {
+                        // This closes the then-block. Check for else
+                        pos += 1;
+                        // Skip newlines
+                        while pos < self.tokens.len() && matches!(self.tokens[pos].kind, TokenKind::Newline) {
+                            pos += 1;
+                        }
+                        // If there's an else, continue scanning the else block
+                        if pos < self.tokens.len() && matches!(self.tokens[pos].kind, TokenKind::Else) {
+                            pos += 1; // skip 'else'
+                            // Check if else is followed by if (else-if) or a block
+                            while pos < self.tokens.len() && matches!(self.tokens[pos].kind, TokenKind::Newline) {
+                                pos += 1;
+                            }
+                            if pos < self.tokens.len() && matches!(self.tokens[pos].kind, TokenKind::If) {
+                                // else if - need to scan another if construct
+                                // This will be handled in the next iterations
+                                seen_first_brace = false;
+                                continue;
+                            }
+                            // else block - reset and continue
+                            seen_first_brace = false;
+                            continue;
+                        }
+                        // No else, we're done
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            pos += 1;
+        }
+
+        // If we hit the limit, assume it's a statement
+        if (pos - start_pos) >= max_lookahead {
+            return false;
+        }
+
+        // Skip newlines
+        while pos < self.tokens.len() && matches!(self.tokens[pos].kind, TokenKind::Newline) {
+            pos += 1;
+        }
+
+        // Check if followed by postfix operators that continue the expression
+        if pos < self.tokens.len() {
+            matches!(self.tokens[pos].kind,
+                TokenKind::Dot |        // .method()
+                TokenKind::Question |   // ?
+                TokenKind::LBracket |   // [index]
+                TokenKind::As           // as Type
+            )
+        } else {
+            false
+        }
+    }
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
@@ -2109,6 +2356,11 @@ impl Parser {
             TokenKind::JSXAttribute => "JSXAttribute",
             TokenKind::JSXText => "JSXText",
             TokenKind::JSXExpressionContainer => "JSXExpressionContainer",
+            // Type keywords that can also be variant names (e.g. Expression::BooleanLiteral)
+            TokenKind::Bool => "Bool",
+            TokenKind::Str => "String",
+            TokenKind::I32 => "Number",
+            TokenKind::F64 => "Float",
             _ => return None,
         };
         self.advance();
