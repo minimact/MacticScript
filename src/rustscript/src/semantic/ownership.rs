@@ -151,6 +151,11 @@ impl OwnershipChecker {
                     }
                 }
             }
+
+            Stmt::Function(fn_decl) => {
+                // Check nested function
+                self.check_function(fn_decl);
+            }
         }
     }
 
@@ -267,6 +272,21 @@ impl OwnershipChecker {
                 self.check_expr(inner);
             }
 
+            Expr::Matches(matches_expr) => {
+                // Check the scrutinee expression
+                self.check_expr(&matches_expr.scrutinee);
+                // Pattern doesn't need ownership checking
+            }
+
+            Expr::Return(value) => {
+                if let Some(ref expr) = value {
+                    self.check_expr(expr);
+                }
+            }
+
+            Expr::Break => {}
+            Expr::Continue => {}
+
             Expr::Literal(_) | Expr::Ident(_) => {}
         }
     }
@@ -314,6 +334,9 @@ impl OwnershipChecker {
 
             // Try expressions produce owned values (unwrapped from Result)
             Expr::Try(_) => {}
+
+            // Return/break/continue don't produce values (they diverge)
+            Expr::Return(_) | Expr::Break | Expr::Continue => {}
 
             // These are OK - they produce owned values
             Expr::Literal(_)

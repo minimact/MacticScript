@@ -195,7 +195,19 @@ impl Parser {
                 PluginItem::Struct(self.parse_struct()?)
             } else if self.check(TokenKind::Enum) {
                 PluginItem::Enum(self.parse_enum()?)
-            } else if self.check(TokenKind::Fn) || self.check(TokenKind::Pub) {
+            } else if self.check(TokenKind::Pub) {
+                // Handle pub struct, pub enum, pub fn
+                self.advance(); // consume 'pub'
+                if self.check(TokenKind::Struct) {
+                    PluginItem::Struct(self.parse_struct()?)
+                } else if self.check(TokenKind::Enum) {
+                    PluginItem::Enum(self.parse_enum()?)
+                } else if self.check(TokenKind::Fn) {
+                    PluginItem::Function(self.parse_function()?)
+                } else {
+                    return Err(self.error("Expected struct, enum, or fn after 'pub'"));
+                }
+            } else if self.check(TokenKind::Fn) {
                 PluginItem::Function(self.parse_function()?)
             } else if self.check(TokenKind::Impl) {
                 PluginItem::Impl(self.parse_impl()?)
@@ -224,6 +236,10 @@ impl Parser {
             }
 
             let field_span = self.current_span();
+            // Skip 'pub' if present on field
+            if self.check(TokenKind::Pub) {
+                self.advance();
+            }
             let field_name = self.expect_ident()?;
             self.expect(TokenKind::Colon)?;
             let ty = self.parse_type()?;
@@ -264,9 +280,15 @@ impl Parser {
             }
 
             let variant_span = self.current_span();
-            let variant_name = self.expect_ident()?;
+            // Allow AST type keywords as variant names (e.g., BinaryExpression, CallExpression)
+            let variant_name = if let Some(ast_type) = self.try_expect_ast_type() {
+                ast_type
+            } else {
+                self.expect_ident()?
+            };
 
             let fields = if self.check(TokenKind::LParen) {
+                // Tuple variant: Variant(Type1, Type2)
                 self.advance();
                 let mut types = Vec::new();
                 if !self.check(TokenKind::RParen) {
@@ -276,9 +298,32 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RParen)?;
-                Some(types)
+                EnumVariantFields::Tuple(types)
+            } else if self.check(TokenKind::LBrace) {
+                // Struct variant: Variant { field1: Type1, field2: Type2 }
+                self.advance();
+                let mut named_fields = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.check(TokenKind::RBrace) {
+                        break;
+                    }
+                    let field_name = self.expect_ident()?;
+                    self.expect(TokenKind::Colon)?;
+                    let field_type = self.parse_type()?;
+                    named_fields.push((field_name, field_type));
+
+                    self.skip_newlines();
+                    if !self.match_token(TokenKind::Comma) {
+                        self.skip_newlines();
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBrace)?;
+                EnumVariantFields::Struct(named_fields)
             } else {
-                None
+                // Unit variant: Variant
+                EnumVariantFields::Unit
             };
 
             variants.push(EnumVariant {
@@ -309,6 +354,26 @@ impl Parser {
         self.expect(TokenKind::Fn)?;
         let name = self.expect_ident()?;
 
+        // Parse generic type parameters: <F, T>
+        let type_params = if self.match_token(TokenKind::Lt) {
+            let mut params = Vec::new();
+            loop {
+                let param_span = self.current_span();
+                let param_name = self.expect_ident()?;
+                params.push(GenericParam {
+                    name: param_name,
+                    span: param_span,
+                });
+                if !self.match_token(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+            params
+        } else {
+            Vec::new()
+        };
+
         self.expect(TokenKind::LParen)?;
         let params = self.parse_params()?;
         self.expect(TokenKind::RParen)?;
@@ -319,13 +384,48 @@ impl Parser {
             None
         };
 
+        // Skip newlines before checking for where clause
+        self.skip_newlines();
+
+        // Parse where clause: where F: Fn(...)
+        let where_clause = if self.check_ident("where") {
+            self.advance();
+            self.skip_newlines();
+            let mut predicates = Vec::new();
+            loop {
+                let pred_span = self.current_span();
+                let target = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let bound = self.parse_type()?;
+                predicates.push(WherePredicate {
+                    target,
+                    bound,
+                    span: pred_span,
+                });
+                self.skip_newlines();
+                if !self.match_token(TokenKind::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+                // Allow trailing comma before block
+                if self.check(TokenKind::LBrace) {
+                    break;
+                }
+            }
+            predicates
+        } else {
+            Vec::new()
+        };
+
         let body = self.parse_block()?;
 
         Ok(FnDecl {
             is_pub,
             name,
+            type_params,
             params,
             return_type,
+            where_clause,
             body,
             span: start_span,
         })
@@ -469,6 +569,29 @@ impl Parser {
         // Get the type name
         let name = self.expect_type_name()?;
 
+        // Check for Fn trait type: Fn(T1, T2) -> R
+        if name == "Fn" {
+            self.expect(TokenKind::LParen)?;
+            let mut params = Vec::new();
+            if !self.check(TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_type()?);
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+
+            let return_type = if self.match_token(TokenKind::Arrow) {
+                Box::new(self.parse_type()?)
+            } else {
+                Box::new(Type::Unit)
+            };
+
+            return Ok(Type::FnTrait { params, return_type });
+        }
+
         // Check for type arguments
         if self.match_token(TokenKind::Lt) {
             let mut type_args = Vec::new();
@@ -547,7 +670,11 @@ impl Parser {
         self.skip_newlines();
 
 
-        if self.check(TokenKind::Let) {
+        if self.check(TokenKind::Fn) {
+            // Nested function declaration
+            let func = self.parse_function()?;
+            Ok(Stmt::Function(func))
+        } else if self.check(TokenKind::Let) {
             self.parse_let_stmt()
         } else if self.check(TokenKind::Const) {
             self.parse_const_stmt()
@@ -725,7 +852,7 @@ impl Parser {
     fn parse_match_arm(&mut self) -> ParseResult<MatchArm> {
         let start_span = self.current_span();
         let pattern = self.parse_pattern()?;
-        self.expect(TokenKind::FatArrow)?;
+        self.expect(TokenKind::DDArrow)?;
         let body = self.parse_expr()?;
 
         // Optional comma
@@ -758,6 +885,26 @@ impl Parser {
             });
         }
 
+        // Parse the base pattern (single pattern without OR)
+        let base_pattern = self.parse_single_pattern()?;
+
+        // Check for OR pattern: pattern | pattern | ...
+        if self.match_token(TokenKind::Pipe) {
+            let mut patterns = vec![base_pattern];
+            loop {
+                patterns.push(self.parse_single_pattern()?);
+                if !self.match_token(TokenKind::Pipe) {
+                    break;
+                }
+            }
+            return Ok(Pattern::Or(patterns));
+        }
+
+        Ok(base_pattern)
+    }
+
+    /// Parse a single pattern (not including OR)
+    fn parse_single_pattern(&mut self) -> ParseResult<Pattern> {
         // Check for wildcard
         if self.check_ident("_") {
             self.advance();
@@ -821,19 +968,60 @@ impl Parser {
                 self.expect_ident()?
             };
 
-            // Path-qualified patterns are always variant patterns
+            // Path-qualified patterns can be tuple variants, struct variants, or unit variants
             if self.check(TokenKind::LParen) {
-                // Path::Variant(inner)
+                // Path::Variant(inner) - tuple variant
                 self.advance();
                 let inner = if self.check(TokenKind::RParen) {
                     None
                 } else {
-                    Some(Box::new(self.parse_pattern()?))
+                    // Parse tuple elements
+                    let mut elements = vec![];
+                    loop {
+                        elements.push(self.parse_pattern()?);
+                        if !self.match_token(TokenKind::Comma) {
+                            break;
+                        }
+                        // Allow trailing comma
+                        if self.check(TokenKind::RParen) {
+                            break;
+                        }
+                    }
+                    // If single element, just use that pattern; otherwise wrap in tuple
+                    if elements.len() == 1 {
+                        Some(Box::new(elements.into_iter().next().unwrap()))
+                    } else {
+                        Some(Box::new(Pattern::Tuple(elements)))
+                    }
                 };
                 self.expect(TokenKind::RParen)?;
                 Ok(Pattern::Variant { name: variant_name, inner })
+            } else if self.check(TokenKind::LBrace) {
+                // Path::Variant { field: pattern } - struct variant
+                self.advance();
+                let mut fields = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.check(TokenKind::RBrace) {
+                        break;
+                    }
+                    let field_name = self.expect_ident()?;
+                    // Support shorthand: { x, y } instead of { x: x, y: y }
+                    let field_pattern = if self.match_token(TokenKind::Colon) {
+                        self.parse_pattern()?
+                    } else {
+                        Pattern::Ident(field_name.clone())
+                    };
+                    fields.push((field_name, field_pattern));
+
+                    if !self.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBrace)?;
+                Ok(Pattern::Struct { name: variant_name, fields })
             } else {
-                // Path::Variant (unit variant)
+                // Path::Variant - unit variant
                 Ok(Pattern::Variant { name: variant_name, inner: None })
             }
         } else if self.check(TokenKind::LBrace) {
@@ -862,20 +1050,15 @@ impl Parser {
             let inner = if self.check(TokenKind::RParen) {
                 None
             } else {
+                // Skip 'mut' keyword if present (e.g., Some(mut x))
+                // Mutability is ignored for transpilation purposes
+                if self.check(TokenKind::Mut) {
+                    self.advance();
+                }
                 Some(Box::new(self.parse_pattern()?))
             };
             self.expect(TokenKind::RParen)?;
             Ok(Pattern::Variant { name, inner })
-        } else if self.match_token(TokenKind::Pipe) {
-            // Or pattern
-            let mut patterns = vec![Pattern::Ident(name)];
-            loop {
-                patterns.push(self.parse_pattern()?);
-                if !self.match_token(TokenKind::Pipe) {
-                    break;
-                }
-            }
-            Ok(Pattern::Or(patterns))
         } else {
             // Check if this is a unit variant like None
             if name == "None" || name == "true" || name == "false" {
@@ -1157,7 +1340,43 @@ impl Parser {
                         span,
                     });
                 } else if self.match_token(TokenKind::LBracket) {
-                    let index = self.parse_expr()?;
+                    // Index access or range slice (same logic as in parse_call)
+                    // Check for open-start range: [..end]
+                    let index = if self.check(TokenKind::DotDot) {
+                        self.advance(); // consume ..
+                        let end = if self.check(TokenKind::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        Expr::Range(RangeExpr {
+                            start: None,
+                            end,
+                            inclusive: false,
+                            span: self.current_span(),
+                        })
+                    } else {
+                        // Parse first expression
+                        let start_expr = self.parse_expr()?;
+
+                        // Check for range: start..end
+                        if self.match_token(TokenKind::DotDot) {
+                            let end = if self.check(TokenKind::RBracket) {
+                                None
+                            } else {
+                                Some(Box::new(self.parse_expr()?))
+                            };
+                            Expr::Range(RangeExpr {
+                                start: Some(Box::new(start_expr)),
+                                end,
+                                inclusive: false,
+                                span: self.current_span(),
+                            })
+                        } else {
+                            // Regular index access
+                            start_expr
+                        }
+                    };
                     self.expect(TokenKind::RBracket)?;
                     let span = self.current_span();
                     expr = Expr::Index(IndexExpr {
@@ -1167,6 +1386,10 @@ impl Parser {
                     });
                 } else if self.match_token(TokenKind::ColonColon) {
                     // Path expression like fs::write or HashMap::new
+                    // Check for turbofish syntax (not supported)
+                    if self.check(TokenKind::Lt) {
+                        return Err(self.error("Turbofish syntax (`::<Type>`) is not supported. Use type annotations instead: `let result: Type = expr.method()`"));
+                    }
                     let method = self.expect_ident()?;
                     let span = self.current_span();
                     expr = Expr::Member(MemberExpr {
@@ -1676,35 +1899,111 @@ impl Parser {
                     span,
                 });
             } else if self.match_token(TokenKind::LBracket) {
-                // Index access
-                let index = self.parse_expr()?;
-                self.expect(TokenKind::RBracket)?;
-                let span = self.current_span();
-                expr = Expr::Index(IndexExpr {
-                    object: Box::new(expr),
-                    index: Box::new(index),
-                    span,
-                });
+                // Index access or range slice
+                // Check for open-start range: [..end]
+                if self.check(TokenKind::DotDot) {
+                    self.advance(); // consume ..
+                    let end = if self.check(TokenKind::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()?))
+                    };
+                    self.expect(TokenKind::RBracket)?;
+                    let span = self.current_span();
+                    let range = Expr::Range(RangeExpr {
+                        start: None,
+                        end,
+                        inclusive: false,
+                        span: span.clone(),
+                    });
+                    expr = Expr::Index(IndexExpr {
+                        object: Box::new(expr),
+                        index: Box::new(range),
+                        span,
+                    });
+                } else {
+                    // Parse first expression
+                    let start_expr = self.parse_expr()?;
+
+                    // Check for range: start..end
+                    if self.match_token(TokenKind::DotDot) {
+                        let end = if self.check(TokenKind::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        self.expect(TokenKind::RBracket)?;
+                        let span = self.current_span();
+                        let range = Expr::Range(RangeExpr {
+                            start: Some(Box::new(start_expr)),
+                            end,
+                            inclusive: false,
+                            span: span.clone(),
+                        });
+                        expr = Expr::Index(IndexExpr {
+                            object: Box::new(expr),
+                            index: Box::new(range),
+                            span,
+                        });
+                    } else {
+                        // Regular index access
+                        self.expect(TokenKind::RBracket)?;
+                        let span = self.current_span();
+                        expr = Expr::Index(IndexExpr {
+                            object: Box::new(expr),
+                            index: Box::new(start_expr),
+                            span,
+                        });
+                    }
+                }
             } else if self.match_token(TokenKind::ColonColon) {
                 // Static method call like HashMap::new or Expr::CallExpression
+                // Check for turbofish syntax (not supported)
+                if self.check(TokenKind::Lt) {
+                    return Err(self.error("Turbofish syntax (`::<Type>`) is not supported. Use type annotations instead: `let result: Type = expr.method()`"));
+                }
+
                 let method = if let Some(ast_type) = self.try_expect_ast_type() {
                     ast_type
+                } else if self.check(TokenKind::Lt) {
+                    // Double-check for < after AST type check failed
+                    return Err(self.error("Turbofish syntax (`::<Type>`) is not supported. Use type annotations instead: `let result: Type = expr.method()`"));
                 } else {
                     self.expect_ident()?
                 };
                 let span = self.current_span();
-                expr = Expr::Member(MemberExpr {
-                    object: Box::new(expr),
-                    property: method,
-                    optional: false,
-                    computed: false,
-                    is_path: true,
-                    span,
-                });
+
+                // Check if this is a struct variant construction: Type::Variant { field: value }
+                if self.check(TokenKind::LBrace) {
+                    // Get the full path as a string (e.g., "Message::Move")
+                    let path = if let Expr::Ident(ident) = &expr {
+                        format!("{}::{}", ident.name, method)
+                    } else {
+                        // For complex paths, just use the method name
+                        method.clone()
+                    };
+                    expr = self.parse_struct_init(path, span)?;
+                } else {
+                    expr = Expr::Member(MemberExpr {
+                        object: Box::new(expr),
+                        property: method,
+                        optional: false,
+                        computed: false,
+                        is_path: true,
+                        span,
+                    });
+                }
             } else if self.match_token(TokenKind::Question) {
                 // Try operator: expr?
                 let span = self.current_span();
                 expr = Expr::Try(Box::new(expr));
+            } else if self.match_token(TokenKind::As) {
+                // Type cast: expr as Type
+                // For now, we'll parse the type but ignore it in codegen
+                // since JavaScript doesn't have type casts
+                let _target_type = self.parse_type()?;
+                // Keep the expression as-is, the cast is just for type checking
+                // expr remains unchanged
             } else {
                 break;
             }
@@ -1746,6 +2045,26 @@ impl Parser {
         // Match expression
         if self.check(TokenKind::Match) {
             return self.parse_match_expr();
+        }
+
+        // Return expression: return or return expr
+        if self.match_token(TokenKind::Return) {
+            let value = if self.check(TokenKind::Comma) || self.check(TokenKind::Semicolon) || self.check(TokenKind::RBrace) {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()?))
+            };
+            return Ok(Expr::Return(value));
+        }
+
+        // Break expression
+        if self.match_token(TokenKind::Break) {
+            return Ok(Expr::Break);
+        }
+
+        // Continue expression
+        if self.match_token(TokenKind::Continue) {
+            return Ok(Expr::Continue);
         }
 
         // Block expression
@@ -1791,9 +2110,13 @@ impl Parser {
             }
         }
 
-        // Closure
+        // Closure: |params| body or || body
         if self.check(TokenKind::Pipe) {
             return self.parse_closure(span);
+        }
+        // Empty closure: || body (lexed as Or token)
+        if self.check(TokenKind::Or) {
+            return self.parse_empty_closure(span);
         }
 
         // Literal
@@ -1858,19 +2181,19 @@ impl Parser {
             }
         }
 
-        // matches! macro
+        // matches! macro: matches!(expr, pattern)
         if self.match_token(TokenKind::Matches) {
             self.expect(TokenKind::LParen)?;
-            let args = self.parse_args()?;
+            // First arg: expression to match
+            let scrutinee = self.parse_expr()?;
+            self.expect(TokenKind::Comma)?;
+            self.skip_newlines();
+            // Second arg: pattern
+            let pattern = self.parse_pattern()?;
             self.expect(TokenKind::RParen)?;
-            return Ok(Expr::Call(CallExpr {
-                callee: Box::new(Expr::Ident(IdentExpr {
-                    name: "matches!".to_string(),
-                    span,
-                })),
-                args,
-                type_args: Vec::new(),
-                optional: false,
+            return Ok(Expr::Matches(MatchesExpr {
+                scrutinee: Box::new(scrutinee),
+                pattern,
                 span,
             }));
         }
@@ -2028,6 +2351,26 @@ impl Parser {
         }))
     }
 
+    /// Parse empty closure: || body
+    /// The || is lexed as a single Or token
+    fn parse_empty_closure(&mut self, span: Span) -> ParseResult<Expr> {
+        self.expect(TokenKind::Or)?; // consume ||
+
+        // Closure body can be either an expression or a block
+        let body = if self.check(TokenKind::LBrace) {
+            let block = self.parse_block()?;
+            Expr::Block(block)
+        } else {
+            self.parse_expr()?
+        };
+
+        Ok(Expr::Closure(ClosureExpr {
+            params: Vec::new(), // empty params
+            body: Box::new(body),
+            span,
+        }))
+    }
+
     /// Parse if expression (can be used as value)
     fn parse_if_expr(&mut self) -> ParseResult<Expr> {
         let start_span = self.current_span();
@@ -2116,8 +2459,16 @@ impl Parser {
             }
 
             let field_name = self.expect_ident()?;
-            self.expect(TokenKind::Colon)?;
-            let value = self.parse_expr()?;
+            let value = if self.check(TokenKind::Colon) {
+                self.advance(); // consume ':'
+                self.parse_expr()?
+            } else {
+                // Field shorthand: { field } means { field: field }
+                Expr::Ident(IdentExpr {
+                    name: field_name.clone(),
+                    span: self.current_span(),
+                })
+            };
             fields.push((field_name, value));
 
             self.skip_newlines();
@@ -2291,7 +2642,44 @@ impl Parser {
                 self.advance();
                 Ok(name)
             }
-            _ => Err(self.error("Expected identifier")),
+            Some(Token { kind, .. }) => {
+                // Check if it's a keyword that was used where an identifier is expected
+                let keyword_name = match kind {
+                    TokenKind::Fn => Some("fn"),
+                    TokenKind::Let => Some("let"),
+                    TokenKind::Const => Some("const"),
+                    TokenKind::Mut => Some("mut"),
+                    TokenKind::If => Some("if"),
+                    TokenKind::Else => Some("else"),
+                    TokenKind::For => Some("for"),
+                    TokenKind::In => Some("in"),
+                    TokenKind::While => Some("while"),
+                    TokenKind::Loop => Some("loop"),
+                    TokenKind::Return => Some("return"),
+                    TokenKind::Break => Some("break"),
+                    TokenKind::Continue => Some("continue"),
+                    TokenKind::Match => Some("match"),
+                    TokenKind::Struct => Some("struct"),
+                    TokenKind::Enum => Some("enum"),
+                    TokenKind::Impl => Some("impl"),
+                    TokenKind::Pub => Some("pub"),
+                    TokenKind::Use => Some("use"),
+                    TokenKind::Plugin => Some("plugin"),
+                    TokenKind::Writer => Some("writer"),
+                    TokenKind::Traverse => Some("traverse"),
+                    _ => None,
+                };
+
+                if let Some(keyword) = keyword_name {
+                    Err(self.error(&format!(
+                        "Expected identifier, found keyword '{}' (keywords cannot be used as variable names)",
+                        keyword
+                    )))
+                } else {
+                    Err(self.error("Expected identifier"))
+                }
+            }
+            None => Err(self.error("Expected identifier, found end of file")),
         }
     }
 

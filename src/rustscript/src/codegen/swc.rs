@@ -607,11 +607,25 @@ impl SwcGenerator {
         self.indent += 1;
         for variant in &e.variants {
             self.emit_indent();
-            if let Some(fields) = &variant.fields {
-                let types: Vec<String> = fields.iter().map(|t| self.type_to_rust(t)).collect();
-                self.emit(&format!("{}({}),\n", variant.name, types.join(", ")));
-            } else {
-                self.emit(&format!("{},\n", variant.name));
+            match &variant.fields {
+                EnumVariantFields::Tuple(fields) => {
+                    let types: Vec<String> = fields.iter().map(|t| self.type_to_rust(t)).collect();
+                    self.emit(&format!("{}({}),\n", variant.name, types.join(", ")));
+                }
+                EnumVariantFields::Struct(named_fields) => {
+                    self.emit(&format!("{} {{\n", variant.name));
+                    self.indent += 1;
+                    for (field_name, field_type) in named_fields {
+                        self.emit_indent();
+                        self.emit(&format!("{}: {},\n", field_name, self.type_to_rust(field_type)));
+                    }
+                    self.indent -= 1;
+                    self.emit_indent();
+                    self.emit("},\n");
+                }
+                EnumVariantFields::Unit => {
+                    self.emit(&format!("{},\n", variant.name));
+                }
             }
         }
         self.indent -= 1;
@@ -621,6 +635,15 @@ impl SwcGenerator {
 
     fn gen_helper_function(&mut self, f: &FnDecl) {
         let pub_str = if f.is_pub { "pub " } else { "" };
+
+        // Generate type parameters: <F, T>
+        let type_params = if !f.type_params.is_empty() {
+            let params: Vec<String> = f.type_params.iter().map(|p| p.name.clone()).collect();
+            format!("<{}>", params.join(", "))
+        } else {
+            String::new()
+        };
+
         let params: Vec<String> = f.params.iter().map(|p| {
             format!("{}: {}", p.name, self.type_to_rust(&p.ty))
         }).collect();
@@ -629,7 +652,17 @@ impl SwcGenerator {
             .map(|t| format!(" -> {}", self.type_to_rust(t)))
             .unwrap_or_default();
 
-        self.emit_line(&format!("{}fn {}({}){} {{", pub_str, f.name, params.join(", "), ret_type));
+        // Generate where clause
+        let where_clause = if !f.where_clause.is_empty() {
+            let predicates: Vec<String> = f.where_clause.iter().map(|p| {
+                format!("    {}: {}", p.target, self.type_to_rust(&p.bound))
+            }).collect();
+            format!("\nwhere\n{}", predicates.join(",\n"))
+        } else {
+            String::new()
+        };
+
+        self.emit_line(&format!("{}fn {}{}({}){}{} {{", pub_str, f.name, type_params, params.join(", "), ret_type, where_clause));
         self.indent += 1;
 
         // Track parameter types in the environment
@@ -1052,12 +1085,32 @@ impl SwcGenerator {
                 format!("Option<{}>", self.type_to_rust(inner))
             }
             Type::Unit => "()".to_string(),
+            Type::FnTrait { params, return_type } => {
+                let param_types: Vec<String> = params.iter().map(|t| self.type_to_rust(t)).collect();
+                let ret = self.type_to_rust(return_type);
+                format!("Fn({}) -> {}", param_types.join(", "), ret)
+            }
         }
     }
 
     fn gen_block(&mut self, block: &Block) {
-        for stmt in &block.stmts {
-            self.gen_stmt(stmt);
+        let len = block.stmts.len();
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            let is_last = i == len - 1;
+            self.gen_stmt_with_context(stmt, is_last);
+        }
+    }
+
+    fn gen_stmt_with_context(&mut self, stmt: &Stmt, is_last_in_block: bool) {
+        // If this is the last statement in a block and it's an expression,
+        // don't add a semicolon (it's the block's return value)
+        match stmt {
+            Stmt::Expr(expr_stmt) if is_last_in_block => {
+                self.emit_indent();
+                self.gen_expr(&expr_stmt.expr);
+                self.emit("\n");
+            }
+            _ => self.gen_stmt(stmt),
         }
     }
 
@@ -1374,6 +1427,30 @@ impl SwcGenerator {
             }
             Stmt::Traverse(traverse_stmt) => {
                 self.gen_traverse_stmt(traverse_stmt);
+            }
+            Stmt::Function(fn_decl) => {
+                // Generate nested function
+                self.emit_indent();
+                self.emit("fn ");
+                self.emit(&fn_decl.name);
+                self.emit("(");
+                for (i, param) in fn_decl.params.iter().enumerate() {
+                    if i > 0 {
+                        self.emit(", ");
+                    }
+                    self.emit(&param.name);
+                    self.emit(&format!(": {}", self.type_to_rust(&param.ty)));
+                }
+                self.emit(")");
+                if let Some(return_type) = &fn_decl.return_type {
+                    self.emit(&format!(" -> {}", self.type_to_rust(return_type)));
+                }
+                self.emit(" {\n");
+                self.indent += 1;
+                self.gen_block(&fn_decl.body);
+                self.indent -= 1;
+                self.emit_indent();
+                self.emit("}\n");
             }
         }
     }
@@ -1778,6 +1855,7 @@ impl SwcGenerator {
             Type::Tuple(_) => TypeContext::unknown(),
             Type::Optional(inner) => self.type_from_ast(inner),
             Type::Unit => TypeContext::unknown(),
+            Type::FnTrait { .. } => TypeContext::unknown(),
         }
     }
 
@@ -2331,6 +2409,31 @@ impl SwcGenerator {
                     self.gen_expr(elem);
                 }
                 self.emit(")");
+            }
+
+            Expr::Matches(matches_expr) => {
+                // Generate matches! macro in Rust
+                self.emit("matches!(");
+                self.gen_expr(&matches_expr.scrutinee);
+                self.emit(", ");
+                self.gen_pattern(&matches_expr.pattern);
+                self.emit(")");
+            }
+
+            Expr::Return(value) => {
+                self.emit("return");
+                if let Some(ref expr) = value {
+                    self.emit(" ");
+                    self.gen_expr(expr);
+                }
+            }
+
+            Expr::Break => {
+                self.emit("break");
+            }
+
+            Expr::Continue => {
+                self.emit("continue");
             }
         }
     }

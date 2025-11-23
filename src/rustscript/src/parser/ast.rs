@@ -91,11 +91,22 @@ pub struct EnumDecl {
     pub span: Span,
 }
 
+/// Enum variant fields
+#[derive(Debug, Clone)]
+pub enum EnumVariantFields {
+    /// Tuple variant: Some(T)
+    Tuple(Vec<Type>),
+    /// Struct variant: Error { message: String }
+    Struct(Vec<(String, Type)>),
+    /// Unit variant: None
+    Unit,
+}
+
 /// Enum variant
 #[derive(Debug, Clone)]
 pub struct EnumVariant {
     pub name: String,
-    pub fields: Option<Vec<Type>>,
+    pub fields: EnumVariantFields,
     pub span: Span,
 }
 
@@ -104,9 +115,26 @@ pub struct EnumVariant {
 pub struct FnDecl {
     pub is_pub: bool,
     pub name: String,
+    pub type_params: Vec<GenericParam>,  // <F, T>
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
+    pub where_clause: Vec<WherePredicate>,  // where F: Fn(...)
     pub body: Block,
+    pub span: Span,
+}
+
+/// Generic type parameter (for Rust-style generics)
+#[derive(Debug, Clone)]
+pub struct GenericParam {
+    pub name: String,
+    pub span: Span,
+}
+
+/// Where clause predicate
+#[derive(Debug, Clone)]
+pub struct WherePredicate {
+    pub target: String,  // The type parameter name (e.g., "F")
+    pub bound: Type,     // The trait bound (e.g., Fn(...) -> Str)
     pub span: Span,
 }
 
@@ -151,6 +179,11 @@ pub enum Type {
     Optional(Box<Type>),
     /// Unit type: ()
     Unit,
+    /// Function trait: Fn(T1, T2) -> R
+    FnTrait {
+        params: Vec<Type>,
+        return_type: Box<Type>,
+    },
 }
 
 // =============================================================================
@@ -315,6 +348,7 @@ pub enum Stmt {
     Break(BreakStmt),
     Continue(ContinueStmt),
     Traverse(TraverseStmt),
+    Function(FnDecl),  // Nested function declaration
 }
 
 /// Let statement: `let [mut] name [: Type] = expr;`
@@ -554,6 +588,14 @@ pub enum Expr {
     Try(Box<Expr>),
     /// Tuple expression: (expr1, expr2, ...)
     Tuple(Vec<Expr>),
+    /// Matches macro: matches!(expr, pattern)
+    Matches(MatchesExpr),
+    /// Return expression: return expr
+    Return(Option<Box<Expr>>),
+    /// Break expression: break
+    Break,
+    /// Continue expression: continue
+    Continue,
 }
 
 /// Literal values
@@ -680,6 +722,14 @@ pub struct IfExpr {
 pub struct MatchExpr {
     pub scrutinee: Expr,
     pub arms: Vec<MatchArm>,
+    pub span: Span,
+}
+
+/// Matches macro expression: matches!(expr, pattern)
+#[derive(Debug, Clone)]
+pub struct MatchesExpr {
+    pub scrutinee: Box<Expr>,
+    pub pattern: Pattern,
     pub span: Span,
 }
 

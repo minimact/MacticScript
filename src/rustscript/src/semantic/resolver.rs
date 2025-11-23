@@ -260,9 +260,15 @@ impl Resolver {
                 PluginItem::Enum(e) => {
                     let mut variants = HashMap::new();
                     for variant in &e.variants {
-                        let fields = variant.fields.as_ref().map(|types| {
-                            types.iter().map(ast_type_to_type_info).collect()
-                        });
+                        let fields = match &variant.fields {
+                            EnumVariantFields::Tuple(types) => {
+                                Some(types.iter().map(ast_type_to_type_info).collect())
+                            }
+                            EnumVariantFields::Struct(named_fields) => {
+                                Some(named_fields.iter().map(|(_, ty)| ast_type_to_type_info(ty)).collect())
+                            }
+                            EnumVariantFields::Unit => None,
+                        };
                         variants.insert(variant.name.clone(), fields);
                     }
                     exports.enums.insert(
@@ -407,9 +413,15 @@ impl Resolver {
     fn declare_enum(&mut self, e: &EnumDecl) {
         let mut variants = HashMap::new();
         for variant in &e.variants {
-            let fields = variant.fields.as_ref().map(|types| {
-                types.iter().map(ast_type_to_type_info).collect()
-            });
+            let fields = match &variant.fields {
+                EnumVariantFields::Tuple(types) => {
+                    Some(types.iter().map(ast_type_to_type_info).collect())
+                }
+                EnumVariantFields::Struct(named_fields) => {
+                    Some(named_fields.iter().map(|(_, ty)| ast_type_to_type_info(ty)).collect())
+                }
+                EnumVariantFields::Unit => None,
+            };
             variants.insert(variant.name.clone(), fields);
         }
         self.env.define_enum(e.name.clone(), variants);
@@ -611,6 +623,40 @@ impl Resolver {
                     }
                 }
             }
+
+            Stmt::Function(fn_decl) => {
+                // Nested function declaration
+                // Define the function in the current scope
+                let param_types: Vec<TypeInfo> = fn_decl.params.iter()
+                    .map(|p| ast_type_to_type_info(&p.ty))
+                    .collect();
+                let ret_type = fn_decl.return_type.as_ref()
+                    .map(ast_type_to_type_info)
+                    .unwrap_or(TypeInfo::Unit);
+                let fn_type = TypeInfo::Function {
+                    params: param_types,
+                    ret: Box::new(ret_type),
+                };
+                if self.env.is_defined_in_current_scope(&fn_decl.name) {
+                    self.errors.push(SemanticError::new(
+                        "RS005",
+                        format!("Function '{}' already defined in this scope", fn_decl.name),
+                        fn_decl.span,
+                    ));
+                }
+                self.env.define(fn_decl.name.clone(), fn_type);
+
+                // Resolve the function body in a new scope
+                self.env.push_scope();
+                // Define parameters in the function scope
+                for param in &fn_decl.params {
+                    let param_type = ast_type_to_type_info(&param.ty);
+                    self.env.define(param.name.clone(), param_type);
+                }
+                // Resolve the body
+                self.resolve_block(&fn_decl.body);
+                self.env.pop_scope();
+            }
         }
     }
 
@@ -743,7 +789,9 @@ impl Resolver {
                     );
                     // Check if it's a known AST node type (used in matches!)
                     let is_ast_type = get_node_mapping(&ident.name).is_some();
-                    if !is_special && !is_ast_type {
+                    // Check if it's a pattern placeholder from matches! macro
+                    let is_pattern_placeholder = ident.name.starts_with("_pattern_");
+                    if !is_special && !is_ast_type && !is_pattern_placeholder {
                         self.errors.push(SemanticError::new(
                             "RS006",
                             format!("Undefined variable: {}", ident.name),
@@ -902,6 +950,22 @@ impl Resolver {
             Expr::Try(inner) => {
                 self.resolve_expr(inner);
             }
+
+            Expr::Matches(matches_expr) => {
+                // Resolve the scrutinee expression
+                self.resolve_expr(&matches_expr.scrutinee);
+                // The pattern doesn't need resolution (it's a pattern, not an expression)
+                // Pattern variables are only bound within the matches! result context
+            }
+
+            Expr::Return(value) => {
+                if let Some(ref expr) = value {
+                    self.resolve_expr(expr);
+                }
+            }
+
+            Expr::Break => {}
+            Expr::Continue => {}
 
             Expr::Literal(_) => {}
         }
