@@ -156,6 +156,11 @@ impl OwnershipChecker {
                 // Check nested function
                 self.check_function(fn_decl);
             }
+
+            Stmt::Verbatim(_) => {
+                // Verbatim blocks are opaque to ownership checking
+                // No analysis performed on raw code
+            }
         }
     }
 
@@ -373,16 +378,32 @@ impl OwnershipChecker {
         if let Expr::Assign(assign) = expr {
             // Check if target is a member expression (direct property mutation)
             if let Expr::Member(member) = assign.target.as_ref() {
-                // Direct property mutation is not allowed
+                // Allow mutations on 'self' (writer/plugin state)
+                // This should work for self.field, self.state.field, etc.
+                if self.starts_with_self(&member.object) {
+                    return; // self.* = value is allowed
+                }
+
+                // Direct property mutation on AST nodes is not allowed
+                let target_name = self.expr_to_string(assign.target.as_ref());
                 self.errors.push(
                     SemanticError::new(
                         "RS002",
-                        "Direct property mutation not allowed",
+                        &format!("Direct property mutation not allowed on '{}'", target_name),
                         member.span,
                     )
-                    .with_hint("replace the entire node instead of mutating properties, use `*node = NodeType { ... }` pattern"),
+                    .with_hint("AST node mutation can break Babel's scope tracker. Use the clone-and-rebuild pattern: `*node = NodeType { field: new_value, ..node.clone() }`"),
                 );
             }
+        }
+    }
+
+    /// Check if an expression starts with 'self'
+    fn starts_with_self(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident(ident) => ident.name == "self",
+            Expr::Member(member) => self.starts_with_self(&member.object),
+            _ => false,
         }
     }
 

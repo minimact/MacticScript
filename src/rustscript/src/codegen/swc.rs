@@ -450,22 +450,60 @@ impl SwcGenerator {
     }
 
     fn gen_writer(&mut self, writer: &WriterDecl) {
+        // Separate items by type
+        let mut pre_hook: Option<&FnDecl> = None;
+        let mut exit_hook: Option<&FnDecl> = None;
+        let mut methods = Vec::new();
+        let mut structs = Vec::new();
+
+        for item in &writer.body {
+            match item {
+                PluginItem::PreHook(f) => pre_hook = Some(f),
+                PluginItem::ExitHook(f) => exit_hook = Some(f),
+                PluginItem::Function(f) => {
+                    // Treat init() and finish() as aliases for pre/exit hooks
+                    if f.name == "init" && pre_hook.is_none() {
+                        pre_hook = Some(f);
+                    } else if f.name == "finish" && exit_hook.is_none() {
+                        exit_hook = Some(f);
+                    } else {
+                        methods.push(f);
+                    }
+                },
+                PluginItem::Struct(s) => structs.push(s),
+                _ => {}
+            }
+        }
+
         // For writers, use Visit instead of VisitMut
         self.emit_line("use swc_ecma_visit::Visit;");
         self.emit_line("");
 
-        // Generate structs
-        for item in &writer.body {
-            if let PluginItem::Struct(s) = item {
-                self.gen_struct(s);
+        // Find State struct (if any) to flatten its fields into main struct
+        let state_struct = structs.iter().find(|s| s.name == "State").cloned();
+
+        // Generate other structs (not State, as we'll flatten it)
+        for struct_decl in &structs {
+            if struct_decl.name != "State" {
+                self.gen_struct(struct_decl);
+                self.emit_line("");
             }
         }
 
-        // Generate the writer struct with CodeBuilder
+        // Generate the writer struct with CodeBuilder + State fields
         self.emit_line(&format!("pub struct {} {{", writer.name));
         self.indent += 1;
         self.emit_line("output: String,");
         self.emit_line("indent_level: usize,");
+
+        // Flatten State struct fields into main struct
+        if let Some(state) = state_struct {
+            for field in &state.fields {
+                let rust_type = self.type_to_rust(&field.ty);
+                self.emit_line(&format!("{}: {},", field.name, rust_type));
+            }
+        }
+
         self.indent -= 1;
         self.emit_line("}");
         self.emit_line("");
@@ -480,6 +518,15 @@ impl SwcGenerator {
         self.indent += 1;
         self.emit_line("output: String::new(),");
         self.emit_line("indent_level: 0,");
+
+        // Initialize State fields with defaults
+        if let Some(state) = state_struct {
+            for field in &state.fields {
+                let default_value = self.get_default_value_for_type(&field.ty);
+                self.emit_line(&format!("{}: {},", field.name, default_value));
+            }
+        }
+
         self.indent -= 1;
         self.emit_line("}");
         self.indent -= 1;
@@ -515,19 +562,41 @@ impl SwcGenerator {
         self.emit_line("}");
         self.emit_line("");
 
-        self.emit_line("pub fn finish(self) -> String {");
-        self.indent += 1;
-        self.emit_line("self.output");
-        self.indent -= 1;
-        self.emit_line("}");
+        // Generate finish() method
+        if let Some(exit_fn) = exit_hook {
+            // Use exit hook as finish method
+            self.emit_line("/// Finalize output (from exit hook)");
+            self.emit_line("pub fn finish(mut self) -> String {");
+            self.indent += 1;
 
-        // Generate helper functions
-        for item in &writer.body {
-            if let PluginItem::Function(f) = item {
-                if !f.name.starts_with("visit_") {
-                    self.emit_line("");
-                    self.gen_helper_function(f);
-                }
+            // Generate exit hook body
+            self.gen_block(&exit_fn.body);
+
+            // Always return the output at the end
+            self.emit_line("self.output");
+            self.indent -= 1;
+            self.emit_line("}");
+        } else {
+            // Default finish
+            self.emit_line("pub fn finish(self) -> String {");
+            self.indent += 1;
+            self.emit_line("self.output");
+            self.indent -= 1;
+            self.emit_line("}");
+        }
+        self.emit_line("");
+
+        // Emit comment about pre-hook if present (not supported in SWC)
+        if pre_hook.is_some() {
+            self.emit_line("// Note: pre() hook not supported in SWC (no source access)");
+            self.emit_line("");
+        }
+
+        // Generate helper functions (non-visitor methods)
+        for method in &methods {
+            if !method.name.starts_with("visit_") {
+                self.gen_helper_function(method);
+                self.emit_line("");
             }
         }
 
@@ -539,11 +608,9 @@ impl SwcGenerator {
         self.emit_line(&format!("impl Visit for {} {{", writer.name));
         self.indent += 1;
 
-        for item in &writer.body {
-            if let PluginItem::Function(f) = item {
-                if f.name.starts_with("visit_") {
-                    self.gen_visit_method(f);
-                }
+        for method in methods {
+            if method.name.starts_with("visit_") {
+                self.gen_visit_method(method);
             }
         }
 
@@ -961,23 +1028,60 @@ impl SwcGenerator {
 
     fn gen_visit_method(&mut self, f: &FnDecl) {
         // For Visit (read-only), parameters are & not &mut
-        let swc_name = self.visitor_name_to_swc(&f.name);
+        let mut swc_name = self.visitor_name_to_swc(&f.name);
+        // Convert visit_mut_ to visit_ for Visit trait
+        if swc_name.starts_with("visit_mut_") {
+            swc_name = swc_name.replace("visit_mut_", "visit_");
+        }
         let swc_type = self.visitor_name_to_swc_type(&f.name);
 
         self.emit_line("");
         self.emit_line(&format!("fn {}(&mut self, n: &{}) {{", swc_name, swc_type));
         self.indent += 1;
 
-        self.gen_block(&f.body);
+        // Set up parameter renames for visitor methods
+        // The first parameter (typically "node") maps to "n"
+        if let Some(first_param) = f.params.first() {
+            self.param_renames.insert(first_param.name.clone(), "n".to_string());
+        }
+
+        // Track the parameter's type in the environment
+        // Both "n" and the original parameter name should map to the swc_type
+        self.type_env.push_scope();
+        let param_ctx = TypeContext {
+            rustscript_type: swc_type.clone(),
+            swc_type: swc_type.clone(),
+            kind: super::type_context::SwcTypeKind::Struct,
+            known_variant: None,
+            needs_deref: false,
+        };
+        self.type_env.define("n", param_ctx.clone());
+        if let Some(first_param) = f.params.first() {
+            self.type_env.define(&first_param.name, param_ctx);
+        }
+
+        // Generate body - for visitor methods, all statements should have semicolons
+        // (they return (), not an implicit value)
+        for stmt in &f.body.stmts {
+            self.gen_stmt(stmt);
+        }
+
+        // Clear environment and renames
+        self.type_env.pop_scope();
+        self.param_renames.clear();
 
         self.indent -= 1;
         self.emit_line("}");
     }
 
     fn visitor_name_to_swc(&self, name: &str) -> String {
-        // Use mapping module: visit_call_expression -> visit_mut_call_expr
+        // Use mapping module: visit_call_expression -> visit_mut_call_expr or visit_call_expr
         if let Some(mapping) = get_node_mapping_by_visitor(name) {
-            return mapping.swc_visitor.to_string();
+            // For writers (Visit trait), use visit_ prefix instead of visit_mut_
+            let visitor_name = mapping.swc_visitor.to_string();
+            // Check if this is being called in a Visit context (not VisitMut)
+            // For now, we'll just return the mapping as-is and handle it in gen_visit_method
+            return visitor_name;
         }
         // Fallback for unknown visitor methods
         let stripped = name.strip_prefix("visit_").unwrap_or(name);
@@ -1024,6 +1128,13 @@ impl SwcGenerator {
         // Convert RustScript node names to SWC AST types using mapping module
         // Handle both snake_case and PascalCase inputs
 
+        // Handle primitive type aliases first
+        match name {
+            "Number" => return "i32".to_string(),
+            "Bool" => return "bool".to_string(),
+            _ => {}
+        }
+
         // First try direct lookup (PascalCase)
         if let Some(mapping) = get_node_mapping(name) {
             return mapping.swc.to_string();
@@ -1054,6 +1165,8 @@ impl SwcGenerator {
                 match name.as_str() {
                     "Str" => "String".to_string(),
                     "()" => "()".to_string(),
+                    "Number" => "i32".to_string(),
+                    "Bool" => "bool".to_string(),
                     _ => name.clone(),
                 }
             }
@@ -1093,6 +1206,35 @@ impl SwcGenerator {
         }
     }
 
+    /// Get a default value for initializing a type
+    fn get_default_value_for_type(&self, ty: &Type) -> String {
+        match ty {
+            Type::Primitive(name) => {
+                match name.as_str() {
+                    "Str" => "String::new()".to_string(),
+                    "Number" => "0".to_string(),
+                    "Bool" => "false".to_string(),
+                    "()" => "()".to_string(),
+                    "i32" | "i64" | "u32" | "u64" | "usize" | "isize" => "0".to_string(),
+                    "f32" | "f64" => "0.0".to_string(),
+                    "char" => "'\\0'".to_string(),
+                    _ => "Default::default()".to_string(),
+                }
+            }
+            Type::Container { name, .. } => {
+                match name.as_str() {
+                    "Vec" => "Vec::new()".to_string(),
+                    "HashMap" => "HashMap::new()".to_string(),
+                    "HashSet" => "HashSet::new()".to_string(),
+                    _ => format!("{}::new()", name),
+                }
+            }
+            Type::Optional(_) => "None".to_string(),
+            Type::Array { .. } => "Vec::new()".to_string(),
+            _ => "Default::default()".to_string(),
+        }
+    }
+
     fn gen_block(&mut self, block: &Block) {
         let len = block.stmts.len();
         for (i, stmt) in block.stmts.iter().enumerate() {
@@ -1103,11 +1245,31 @@ impl SwcGenerator {
 
     fn gen_stmt_with_context(&mut self, stmt: &Stmt, is_last_in_block: bool) {
         // If this is the last statement in a block and it's an expression,
-        // don't add a semicolon (it's the block's return value)
+        // check if it's actually a return value or just a statement
         match stmt {
             Stmt::Expr(expr_stmt) if is_last_in_block => {
+                // Check if this expression produces a meaningful return value
+                // Calls to push(), insert(), etc. return () so they need semicolons
+                let needs_semicolon = match &expr_stmt.expr {
+                    Expr::Call(call) => {
+                        // Check if it's a method call to a mutating method
+                        if let Expr::Member(mem) = call.callee.as_ref() {
+                            matches!(mem.property.as_str(),
+                                "push" | "insert" | "remove" | "clear" | "append" |
+                                "pop" | "push_str" | "extend" | "drain")
+                        } else {
+                            false
+                        }
+                    }
+                    Expr::Assign(_) => true,  // Assignments return ()
+                    _ => false,
+                };
+
                 self.emit_indent();
                 self.gen_expr(&expr_stmt.expr);
+                if needs_semicolon {
+                    self.emit(";");
+                }
                 self.emit("\n");
             }
             _ => self.gen_stmt(stmt),
@@ -1451,6 +1613,24 @@ impl SwcGenerator {
                 self.indent -= 1;
                 self.emit_indent();
                 self.emit("}\n");
+            }
+            Stmt::Verbatim(verbatim) => {
+                // Emit raw code only for Rust target
+                match verbatim.target {
+                    VerbatimTarget::Rust => {
+                        self.emit_indent();
+                        self.emit(&verbatim.code);
+                        if !verbatim.code.ends_with(';') && !verbatim.code.ends_with('}') {
+                            self.emit(";");
+                        }
+                        self.emit("\n");
+                    }
+                    VerbatimTarget::JavaScript => {
+                        // Skip - this is Babel-only code
+                        self.emit_indent();
+                        self.emit("// Babel-only code omitted\n");
+                    }
+                }
             }
         }
     }
@@ -2193,6 +2373,15 @@ impl SwcGenerator {
                     }
                 }
 
+                // Special case: self.builder in writers becomes just "self"
+                if let Expr::Ident(obj_ident) = mem.object.as_ref() {
+                    if obj_ident.name == "self" && mem.property == "builder" {
+                        // In writer context, self.builder -> self (writer has methods directly)
+                        self.emit("self");
+                        return;
+                    }
+                }
+
                 // Simple member access
                 // Translate module names
                 if let Expr::Ident(ident) = &*mem.object {
@@ -2312,19 +2501,61 @@ impl SwcGenerator {
                 self.emit("]");
             }
             Expr::If(if_expr) => {
-                self.emit("if ");
-                self.gen_expr(&if_expr.condition);
-                self.emit(" { ");
-                for stmt in &if_expr.then_branch.stmts {
-                    self.gen_stmt(stmt);
+                // Check if this is an if-let expression
+                if let Some(pattern) = &if_expr.pattern {
+                    self.emit("if let ");
+                    self.gen_pattern(pattern);
+                    self.emit(" = ");
+                    self.gen_expr(&if_expr.condition);
+                } else {
+                    self.emit("if ");
+                    self.gen_expr(&if_expr.condition);
                 }
-                self.emit(" }");
-                if let Some(else_block) = &if_expr.else_branch {
-                    self.emit(" else { ");
-                    for stmt in &else_block.stmts {
-                        self.gen_stmt(stmt);
+                self.emit(" {");
+                // Check if this is a simple single-expression if (no semicolons needed)
+                let is_simple = if_expr.then_branch.stmts.len() == 1
+                    && matches!(if_expr.then_branch.stmts[0], Stmt::Expr(_))
+                    && if_expr.else_branch.as_ref().map_or(true, |b| b.stmts.len() == 1 && matches!(b.stmts[0], Stmt::Expr(_)));
+
+                if is_simple {
+                    self.emit(" ");
+                    // For simple if-expressions, just emit the expression without indentation
+                    for stmt in &if_expr.then_branch.stmts {
+                        if let Stmt::Expr(expr_stmt) = stmt {
+                            self.gen_expr(&expr_stmt.expr);
+                        }
                     }
                     self.emit(" }");
+                    if let Some(else_block) = &if_expr.else_branch {
+                        self.emit(" else { ");
+                        for stmt in &else_block.stmts {
+                            if let Stmt::Expr(expr_stmt) = stmt {
+                                self.gen_expr(&expr_stmt.expr);
+                            }
+                        }
+                        self.emit(" }");
+                    }
+                } else {
+                    self.emit("\n");
+                    self.indent += 1;
+                    let then_len = if_expr.then_branch.stmts.len();
+                    for (i, stmt) in if_expr.then_branch.stmts.iter().enumerate() {
+                        self.gen_stmt_with_context(stmt, i == then_len - 1);
+                    }
+                    self.indent -= 1;
+                    self.emit_indent();
+                    self.emit("}");
+                    if let Some(else_block) = &if_expr.else_branch {
+                        self.emit(" else {\n");
+                        self.indent += 1;
+                        let else_len = else_block.stmts.len();
+                        for (i, stmt) in else_block.stmts.iter().enumerate() {
+                            self.gen_stmt_with_context(stmt, i == else_len - 1);
+                        }
+                        self.indent -= 1;
+                        self.emit_indent();
+                        self.emit("}");
+                    }
                 }
             }
             Expr::Match(match_expr) => {
