@@ -18,6 +18,6 @@ impl TestIsSimpleExpression {
 impl VisitMut for TestIsSimpleExpression {
     
     fn visit_mut_expr(&mut self, n: &mut Expr) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
 }

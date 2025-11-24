@@ -18,10 +18,10 @@ impl TestDetection {
 impl VisitMut for TestDetection {
     
     fn visit_mut_jsx_element(&mut self, n: &mut JSXElement) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
     
     fn visit_mut_jsx_expr_container(&mut self, n: &mut JSXExprContainer) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
 }

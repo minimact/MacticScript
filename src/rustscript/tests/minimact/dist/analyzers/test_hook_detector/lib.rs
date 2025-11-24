@@ -18,10 +18,10 @@ impl TestHookDetector {
 impl VisitMut for TestHookDetector {
     
     fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
     
     fn visit_mut_var_decl(&mut self, n: &mut VarDecl) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
 }

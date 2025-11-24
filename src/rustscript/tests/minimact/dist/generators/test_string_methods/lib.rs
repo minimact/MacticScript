@@ -18,6 +18,6 @@ impl TestStringMethods {
 impl VisitMut for TestStringMethods {
     
     fn visit_mut_call_expr(&mut self, n: &mut CallExpr) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
 }

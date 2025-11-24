@@ -18,6 +18,6 @@ impl TestTypeConversionIntegration {
 impl VisitMut for TestTypeConversionIntegration {
     
     fn visit_mut_fn_decl(&mut self, n: &mut FnDecl) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
 }

@@ -18,6 +18,6 @@ impl TestBuildMemberPath {
 impl VisitMut for TestBuildMemberPath {
     
     fn visit_mut_member_expr(&mut self, n: &mut MemberExpr) {
-        n.visit_mut_children_with(self);
+        n.visit_mut_children_with(self)
     }
 }

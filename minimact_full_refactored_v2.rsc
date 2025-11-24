@@ -411,7 +411,7 @@ writer MinimactTranspiler {
 
             // ✅ Use infer_type from type_conversion.rsc
             let state_type: Str = if call.arguments.len() > 0 {
-                infer_type(&call.arguments[0])
+                infer_type(&call.arguments[0]).to_string()
             } else {
                 "dynamic".to_string()
             };
